@@ -89,7 +89,7 @@ static int ndpfix_Context_init(struct ndpfix_Context *ctx) {
         return -1;
     }
 
-    return ctx->sock > 0 ? 0 : -1;
+    return 0;
 }
 static void ndpfix_Context_free(struct ndpfix_Context *ctx) {
     close(ctx->sock);
@@ -132,7 +132,7 @@ static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct soc
         }
     }
     if (!foundMacAddr) {
-        fprintf(stderr, "failed to get MAC address for %s\n", ifName);
+        fprintf(stderr, "MAC address not found for %s\n", ifName);
         return -1;
     }
 
@@ -147,6 +147,7 @@ static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct soc
     replyHeader[3] = (uint8_t) checksum;
 
     if (sendto(ctx->sock, replyHeader, sizeof replyHeader, 0, (const struct sockaddr *) addrFrom, sizeof *addrFrom) < 0) {
+        fprintf(stderr, "failed to send packet: %s\n", strerror(errno));
         return -1;
     } else {
         fprintf(stderr, "sent neighbor advertisement, if name %s, MAC address: %02x:%02x:%02x:%02x:%02x:%02x\n", ifName, macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
@@ -173,8 +174,7 @@ int main(int argc, const char *argv[]) {
     fprintf(stdout, "start listening for packets\n");
     while (1) {
         struct sockaddr_in6 addrFrom;
-        struct in6_pktinfo info;
-        socklen_t len;
+        socklen_t len = sizeof addrFrom;
         if ((size = recvfrom(ctx.sock, buffer, sizeof buffer, 0, (struct sockaddr *) &addrFrom, &len)) > 0) {
             if (addrFrom.sin6_family == AF_INET6) {
                 char name[100];
@@ -189,9 +189,7 @@ int main(int argc, const char *argv[]) {
                 if ((rawAddr[0] & 0xe0) == 0x20) {
                     if (type == ND_NEIGHBOR_SOLICIT && code == 0) {
                         fprintf(stdout, "NDP from %s scopeid %d, size = %zd\n", name, addrFrom.sin6_scope_id, size);
-                        if (ndpfix_Context_handleNDP(&ctx, &addrFrom, msg, msgSize) < 0) {
-                            fprintf(stderr, "error while handling NDP\n");
-                        }
+                        ndpfix_Context_handleNDP(&ctx, &addrFrom, msg, msgSize);
                     }
                 }
             }
