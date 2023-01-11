@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/icmp6.h>
@@ -8,9 +9,11 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <assert.h>
+#include <time.h>
 
 // Note: most common usages of the packet library break strict-aliasing, so we do it by hand
 
@@ -22,11 +25,47 @@ struct ndpfix_Context {
 
 struct OCChecksum {
     uint32_t checksum;
-    char leftOver;
+    uint8_t leftOver;
     int hasLeftOver;
 };
 
+enum LogLevel {
+    LOG_INFO,
+    LOG_ERR
+};
+
 static void hexDump(FILE *out, const uint8_t *data, size_t size);
+
+static void valog(enum LogLevel level, const char *fmt, va_list args) {
+    FILE *out = stderr;
+    time_t curTime;
+    struct tm timeForm;
+    time(&curTime);
+    localtime_r(&curTime, &timeForm);
+    fprintf(
+        out,
+        "[%d-%d-%d %d:%02d:%02d]",
+        timeForm.tm_year + 1900,
+        timeForm.tm_mon + 1,
+        timeForm.tm_mday,
+        timeForm.tm_hour,
+        timeForm.tm_min,
+        timeForm.tm_sec
+    );
+    switch (level) {
+        case LOG_INFO: fprintf(out, " [INFO] "); break;
+        case LOG_ERR: fprintf(out, " [ERR] "); break;
+        default: abort();
+    }
+    vfprintf(out, fmt, args);
+    fprintf(out, "\n");
+}
+static void log(enum LogLevel level, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    valog(level, fmt, args);
+    va_end(args);
+}
 
 static inline void OCChecksum_init(struct OCChecksum *chk) {
     chk->checksum = 0;
@@ -56,7 +95,7 @@ static void OCChecksum_update(struct OCChecksum *chk, const uint8_t *data, size_
 static uint16_t OCChecksum_getChecksum(const struct OCChecksum *chk) {
     uint32_t ret = chk->checksum;
     if (chk->hasLeftOver) {
-        ret += (uint8_t)chk->leftOver;
+        ret += chk->leftOver;
     }
     while (ret & 0xffff0000) ret = (ret >> 16) + (ret & 0xffff);
     return (uint16_t) ~ret;
@@ -96,8 +135,14 @@ static void ndpfix_Context_free(struct ndpfix_Context *ctx) {
 }
 static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct sockaddr_in6 *addrFrom, const uint8_t *msg, size_t msgSize) {
     uint8_t targetAddr[16];
-    memcpy(&targetAddr, msg + 4, 16);
+    memcpy(targetAddr, msg + 4, 16);
 
+    {
+        char addrFromName[100], targetAddrName[100];
+        assert(NULL != inet_ntop(AF_INET6, &addrFrom->sin6_addr, addrFromName, sizeof addrFromName));
+        assert(NULL != inet_ntop(AF_INET6, targetAddr, targetAddrName, sizeof targetAddrName));
+        log(LOG_INFO, "solicitation from %s, target %s", addrFromName, targetAddrName);
+    }
     // if (msgSize > 20) {
     //     const uint8_t *options = msg + 20;
     //     fprintf(stdout, "link addr: ");
@@ -108,7 +153,7 @@ static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct soc
     // }
     struct ifaddrs *ifAddrs = NULL;
     if (getifaddrs(&ifAddrs) == -1) {
-        fprintf(stderr, "failed to get interface info: %s\n", strerror(errno));
+        log(LOG_ERR, "failed to get interface info: %s", strerror(errno));
         return -1;
     }
     const char *ifName = NULL;
@@ -125,14 +170,14 @@ static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct soc
     int foundMacAddr = 0;
     for (struct ifaddrs *n = ifAddrs; n; n = n->ifa_next) {
         if (n->ifa_addr->sa_family == AF_LINK && !strcmp(ifName, n->ifa_name)) {
-            struct sockaddr_dl *dl;
             memcpy(macAddr, LLADDR((struct sockaddr_dl *) n->ifa_addr), sizeof macAddr);
             foundMacAddr = 1;
             break;
         }
     }
+    freeifaddrs(ifAddrs);
     if (!foundMacAddr) {
-        fprintf(stderr, "MAC address not found for %s\n", ifName);
+        log(LOG_ERR, "MAC address not found for %s", ifName);
         return -1;
     }
 
@@ -147,10 +192,10 @@ static int ndpfix_Context_handleNDP(struct ndpfix_Context *ctx, const struct soc
     replyHeader[3] = (uint8_t) checksum;
 
     if (sendto(ctx->sock, replyHeader, sizeof replyHeader, 0, (const struct sockaddr *) addrFrom, sizeof *addrFrom) < 0) {
-        fprintf(stderr, "failed to send packet: %s\n", strerror(errno));
+        log(LOG_ERR, "failed to send packet: %s", strerror(errno));
         return -1;
     } else {
-        fprintf(stderr, "sent neighbor advertisement, if name %s, MAC address: %02x:%02x:%02x:%02x:%02x:%02x\n", ifName, macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
+        log(LOG_INFO, "sent neighbor advertisement, if name %s, MAC address: %02x:%02x:%02x:%02x:%02x:%02x", ifName, macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
         return 0;
     }
 }
@@ -164,22 +209,20 @@ static void hexDump(FILE *out, const uint8_t *data, size_t size) {
 int main(int argc, const char *argv[]) {
     struct ndpfix_Context ctx;
     if (ndpfix_Context_init(&ctx) < 0) {
-        fprintf(stderr, "failed to create context: %s\n", strerror(errno));
+        log(LOG_ERR, "failed to create context: %s", strerror(errno));
         return -1;
     }
 
     uint8_t buffer[8192];
     ssize_t size;
 
-    fprintf(stdout, "start listening for packets\n");
+    log(LOG_INFO, "start listening for packets");
     while (1) {
         struct sockaddr_in6 addrFrom;
         socklen_t len = sizeof addrFrom;
         if ((size = recvfrom(ctx.sock, buffer, sizeof buffer, 0, (struct sockaddr *) &addrFrom, &len)) > 0) {
             if (addrFrom.sin6_family == AF_INET6) {
-                char name[100];
                 assert(len == sizeof addrFrom);
-                assert(NULL != inet_ntop(AF_INET6, &addrFrom.sin6_addr, name, sizeof name));
                 uint8_t *rawAddr = (uint8_t *) &addrFrom.sin6_addr;
                 uint8_t type = buffer[0];
                 uint8_t code = buffer[1];
@@ -188,7 +231,6 @@ int main(int argc, const char *argv[]) {
                 size_t msgSize = size - 4;
                 if ((rawAddr[0] & 0xe0) == 0x20) {
                     if (type == ND_NEIGHBOR_SOLICIT && code == 0) {
-                        fprintf(stdout, "NDP from %s scopeid %d, size = %zd\n", name, addrFrom.sin6_scope_id, size);
                         ndpfix_Context_handleNDP(&ctx, &addrFrom, msg, msgSize);
                     }
                 }
